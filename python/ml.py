@@ -7,11 +7,13 @@ import os
 import numpy as np
 from scipy.ndimage.filters import gaussian_filter
 
-folder_data_amyloid = '/home/me404/store/data/201611_PET_Pawel_amyloid'
-folder_data_fdg = '/home/me404/store/data/201712_PET_Pawel_fdg'
-folder_out = '/home/me404/store/projects/201804_SPDHG_PET/results'
-folder_file = '/home/me404/store/repositories/gitbb_spdhg_pawel/python'
-folder_odl = '/home/me404/store/repositories/github_myODL'
+folder_data_amyloid = '/home/cd902/siemens-biograph_data/amyloidPET_FBP_TP0_Matthias'
+# I don't have the fdg data
+# folder_data_fdg = '/home/me404/store/data/201712_PET_Pawel_fdg'
+folder_out = '/home/cd902/GitHub/spdhg_pet/results'
+folder_file = '/home/cd902/GitHub/spdhg_pet/python'
+folder_odl = '/home/cd902/odl'
+
 
 import sys
 sys.path.append(folder_odl)
@@ -27,9 +29,9 @@ from odl.solvers import CallbackPrintIteration, CallbackPrintTiming
 #%% set parameters and create folder structure
 filename = 'ml'
 
-nepoch = 30
-nepoch_target = 5000
-datasets = ['fdg', 'amyloid10min']
+nepoch = 1 #30
+nepoch_target = 5 #5000
+datasets = [ 'amyloid10min']
 
 tol_step = 1e-6
 rho = 0.999

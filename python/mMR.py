@@ -7,7 +7,7 @@ import os
 from builtins import super
 import matplotlib.pyplot as plt
 
-import nipet
+from niftypet import nipet
 import odl
 import misc
 
