@@ -6,14 +6,529 @@ import numpy as np
 import os
 from builtins import super
 import matplotlib.pyplot as plt
+from scipy.ndimage.filters import gaussian_filter
 
 from niftypet import nipet
+from niftypet import nimpa
 import odl
 import misc
+
+__all__ = ( 'load_data', 'load_data_with_mri', 
+           'operator_mmr', 'get_geometry_mmr', 'get_domain_mmr',
+           'get_range_mmr', 'sampling_template', 'sino2ind',
+           'ind2sino', 'indices_full', 'partition_by_angle', 
+           'partition_by_bin', 'partition_random', 'reduce_rings',
+           'simul_data')
+
+def load_data_with_mri(folder_data, span=1, rings=(0, 64), time=None):
+    if time is None:
+        time = (0, 0)
+        s_time = ''
+    else:
+        s_time = '_time{}-{}'.format(time[0], time[1])
+
+    filename_data = '{}/data_rings{}-{}_span{}{}.npy'.format(
+            folder_data, rings[0], rings[1], span, s_time)
+
+    if not os.path.exists(filename_data):
+        print('file {} does NOT exists. Compute it.'.format(filename_data))
+
+        filename_nipet = '{}/data_nipet_span{}{}.npy'.format(folder_data, span,
+                                                             s_time)
+        if not os.path.exists(filename_nipet):
+            print('file {} does NOT exists. Compute it.'
+                  .format(filename_nipet))
+
+            # get all the default constants and LUTs
+            mMRparams = nipet.mmraux.mMR_params()
+            mMRparams['Cnt']['SPN'] = span
+            mMRparams['Cnt']['VERBOSE'] = True  # Switch ON verbose mode
+
+            Cnt = mMRparams['Cnt']
+            txLUT = mMRparams['txLUT']
+            axLUT = mMRparams['axLUT']
+
+            datain = nipet.mmraux.explore_input(folder_data, mMRparams)
+            outpath = os.path.join(datain['corepath'], 'output')
+
+
+            muhdic = nipet.hdw_mumap(
+                    datain,
+                    [1,2,4],
+                    mMRparams,
+                    use_stored=True,
+                    outpath=outpath,
+                    )
+
+            muodic = nipet.obj_mumap(
+                datain,
+                mMRparams,
+                store=True,
+                outpath=outpath,
+                )
+
+            
+
+            recpet = nipet.mmrchain(datain,
+                                    mMRparams,
+                                    outpath=outpath,     # output path for results
+                                    frames=['fluid', [time[0],time[1]]], # definition of time frames
+                                    mu_h=muhdic,
+                                    mu_o=muodic, # or mupdct
+                                    itr=4,          # number of OSEM iterations
+                                    fwhm=0.,        # Gaussian Smoothing FWHM
+                                    recmod=3,    # reconstruction mode: -1: undefined, chosen automatically. 3: attenuation and scatter correction, 1: attenuation correction only, 0: no correction (randoms only)
+                                    fcomment='',    # text comment used in the file name of generated image files
+                                    store_img=True)
+
+            # histogram data
+            hst = nipet.mmrhist(datain, mMRparams, t0=time[0], t1=time[1])
+
+            # get randoms
+            rsn, _ = nipet.randoms(hst, mMRparams)
+
+            # get norm sino
+            nsn = nipet.mmrnorm.get_norm_sino(datain, mMRparams, hst)
+
+            # get scatter                               
+            ssn = nipet.vsm(
+                datain,
+                ([muhdic['im'], muodic['im']]),
+                recpet['im'],
+                hst,
+                rsn,
+                mMRparams)
+
+            #> get registered mri image
+            ft1w = nimpa.pick_t1w(datain)
+            mri_folder = os.path.join(datain['corepath'], 'T1', 'mr2pet')
+            if not os.path.exists(mri_folder):
+                #> find the rigid transformation
+                regdct = nimpa.affine_niftyreg(
+                    recpet['fpet'],
+                    ft1w,
+                    outpath=mri_folder,
+                    executable = Cnt['REGPATH'],
+                    omp=4,
+                    rigOnly = True,
+                    verbose=True
+                )
+
+
+                ft1wpet = nimpa.resample_niftyreg(
+                    recpet['fpet'],
+                    ft1w,
+                    regdct['faff'],
+                    outpath=mri_folder,
+                    pickname='flo',
+                    intrp=1,
+                    executable=Cnt['RESPATH'],
+                    verbose=True,
+                )
+
+                mri_t1 = nimpa.getnii(ft1wpet)
+
+            # take the subsets of all the sinograms (scatter sino will be
+            # separately calculated)
+            psn = hst['psino']
+            # also the reconstructed image for reference
+            imp = nipet.img.mmrimg.convert2dev(recpet['im'], Cnt)
+            # mri image for reference or anatomical priors
+            mri = nipet.img.mmrimg.convert2dev(mri_t1, Cnt)
+
+            muo = nipet.img.mmrimg.convert2dev(muodic['im'], Cnt)
+            muh = nipet.img.mmrimg.convert2dev(muhdic['im'], Cnt)
+
+            op = operator_mmr(span=span)
+            image_attenuation = muo + muh
+
+            att = op.putgaps(op.project_attenuation(image_attenuation))
+
+            # form dictionary of reduced input sinograms
+            data_dict = {'psn': psn, 'nsn': nsn, 'rsn': rsn, 'ssn': ssn,
+                         'muh': muh, 'muo': muo, 'imp': imp, 'att': att,
+                         'mri': mri}
+
+            np.save(filename_nipet, data_dict)
+
+        else:
+            print('file {} exists. Load it.'.format(filename_nipet))
+            data_dict = np.load(filename_nipet, allow_pickle = True).tolist()
+
+        Cnt, txLUT, axLUT = get_geometry_mmr(span, rings)
+
+        # get precomputed values
+        psn = data_dict['psn']
+        nsn = data_dict['nsn']
+        rsn = data_dict['rsn']
+        ssn = data_dict['ssn']
+        imp = data_dict['imp']
+        att = data_dict['att']
+        mri = data_dict['mri']
+        muo = data_dict['muo']
+        muh = data_dict['muh']
+        data_dict = None
+
+        nrings = rings[1] - rings[0]
+        if nrings < 64:
+            # reduce axial FOV: get updated axial LUTs with new entries also in Cnt
+            # (number of sinograms, rings and axial voxels)
+            axLUT = reduce_rings(axLUT, Cnt, rings)
+
+            # take the subsets of all the sinograms (scatter sino will be
+            # separately calculated)
+            psn = psn[axLUT['rLUT'], :, :]
+            nsn = nsn[axLUT['rLUT'], :, :]
+            rsn = rsn[axLUT['rLUT'], :, :]
+            ssn = ssn[axLUT['rLUT'], :, :]
+            att = att[axLUT['rLUT'], :, :]
+
+        # also the reconstructed image for reference
+        image = imp[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
+        image_mr = mri[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
+
+        image_ct = muo[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
+
+        op = operator_mmr(span=span, rings=rings)
+
+        data = np.uint16(op.remgaps(psn))
+        psn = None
+
+        background = op.remgaps(rsn + ssn)
+        factors = op.remgaps(att * nsn)
+
+        normalisation = op.remgaps(nsn)
+        attenuation = op.remgaps(att)
+        scatter = op.remgaps(ssn)
+        randoms = op.remgaps(rsn)
+        rsn, ssn, nsn, att = [None, ] * 4
+
+        np.save(filename_data, (data, background, factors, image, image_mr,
+                                image_ct))
+
+        Y = op.range
+        x = Y.one()
+        sens1 = op.adjoint(x).asarray()
+        opn = operator_mmr(span=span, rings=rings, factors=normalisation)
+        sens2 = opn.adjoint(x).asarray()
+        opf = operator_mmr(span=span, rings=rings, factors=factors)
+        sens3 = opf.adjoint(x).asarray()
+        x = None
+
+        def show_sino(x, title):
+            fig.append(plt.figure())
+            clim = [x.min(), x.max()]
+            x = Y.element(x)
+            misc.imagesc3(op.putgaps(x), clim=clim, title=title)
+
+        def show_image(x, title):
+            fig.append(plt.figure())
+            misc.imagesc3(x, [x.min(), x.max()], title=title)
+
+        fig = []
+        show_sino(normalisation, 'normalisation')
+        show_sino(attenuation, 'attenuation')
+        show_sino(factors, 'multiplicative correction factors')
+        show_sino(data, 'data')
+        show_sino(scatter, 'scatter')
+        show_sino(randoms, 'randoms')
+
+        show_image(sens1, title='sensitivity geometry')
+        show_image(sens2, title='sensitivity geometry + norm')
+        show_image(sens3, title='sensitivity geometry + norm + att')
+
+        show_image(muh, title='hardware attenuation')
+        show_image(image_ct, title='object attenuation')
+
+        bg = op.putgaps(Y.element(background))
+        r = op.putgaps(Y.element(randoms))
+        s = op.putgaps(Y.element(scatter))
+        d = op.putgaps(Y.element(data))
+        a = op.putgaps(Y.element(attenuation))
+        n = op.putgaps(Y.element(normalisation))
+        f = op.putgaps(Y.element(factors))
+
+        fig.append(plt.figure())
+        ind = np.int32(np.array(bg.shape) / 3)
+        plt.plot(d[ind[0], ind[1], :], label='data')
+        plt.plot(bg[ind[0], ind[1], :], label='background')
+        plt.plot(s[ind[0], ind[1], :], label='scatter')
+        plt.plot(r[ind[0], ind[1], :], label='randoms')
+        plt.legend()
+        plt.title('data, 1d')
+
+        fig.append(plt.figure())
+        ind = np.int32(np.array(bg.shape) / 2)
+        plt.plot(d[ind[0], ind[1], :], label='data')
+        plt.plot(10 * f[ind[0], ind[1], :], label='10 x factors')
+        plt.plot(10 * a[ind[0], ind[1], :], label='10 x attenuation')
+        plt.plot(10 * n[ind[0], ind[1], :], label='10 x normalization')
+        plt.legend()
+        plt.title('data, 1d')
+
+        fig.append(plt.figure())
+        ind = np.int32(np.array(bg.shape) / 1.5)
+        plt.plot(d[ind[0], ind[1], :], label='data')
+        plt.plot(bg[ind[0], ind[1], :], label='background')
+        plt.plot(10 * f[ind[0], ind[1], :], label='10 x factors')
+        plt.legend()
+        plt.title('data, 1d')
+        bg, d, a, n, r, s = [None, ] * 6
+
+        fig.append(plt.figure())
+        maxclim = 0.9 * image.max()
+        misc.imagesc3(image, clim=[0, maxclim], title='PET recon')
+
+        fig.append(plt.figure())
+        maxclim = 0.9 * image_mr.max()
+        misc.imagesc3(image_mr, clim=[0, maxclim], title='MRI')
+
+        for i, f in enumerate(fig):
+            filename = '{}_{}.png'.format(filename_data[:-4], i)
+            f.savefig(filename, bbox_inches='tight')
+
+    else:
+        print('file {} exists. Load it.'.format(filename_data))
+        data, background, factors, image, image_mr, image_ct = \
+            np.load(filename_data, allow_pickle = True)
+
+    return data, background, factors, image, image_mr, image_ct
+
+
+def load_data(folder_data, span=1, rings=(0, 64), time=None):
+    if time is None:
+        time = (0, 0)
+        s_time = ''
+    else:
+        s_time = '_time{}-{}'.format(time[0], time[1])
+
+    filename_data = '{}/data_rings{}-{}_span{}{}.npy'.format(
+            folder_data, rings[0], rings[1], span, s_time)
+
+    if not os.path.exists(filename_data):
+        print('file {} does NOT exists. Compute it.'.format(filename_data))
+
+        filename_nipet = '{}/data_nipet_span{}{}.npy'.format(folder_data, span,
+                                                             s_time)
+        if not os.path.exists(filename_nipet):
+            print('file {} does NOT exists. Compute it.'
+                  .format(filename_nipet))
+
+            # get all the default constants and LUTs
+            mMRparams = nipet.get_mmrparams() #mMRparams = nipet.mmraux.mMR_params()
+            mMRparams['Cnt']['SPN'] = span
+            mMRparams['Cnt']['VERBOSE'] = True  # Switch ON verbose mode
+
+            Cnt = mMRparams['Cnt']
+            txLUT = mMRparams['txLUT']
+            axLUT = mMRparams['axLUT']
+
+            datain = nipet.mmraux.explore_input(folder_data, mMRparams)
+
+            muhdic = nipet.img.mmrimg.hdw_mumap(datain, [1, 2, 4], mMRparams,
+                                                use_stored=True)
+
+            muodic = nipet.img.mmrimg.obj_mumap(datain, mMRparams, store=True)
+
+            outpath = os.path.join(datain['corepath'], 'output')
+
+            recpet = nipet.mmrchain(datain,
+                                    mMRparams,
+                                    outpath=outpath,     # output path for results
+                                    frames=['fluid', [time[0],time[1]]], # definition of time frames
+                                    mu_h=muhdic,
+                                    mu_o=muodic, # or mupdct
+                                    itr=4,          # number of OSEM iterations
+                                    fwhm=0.,        # Gaussian Smoothing FWHM
+                                    recmod=3,    # reconstruction mode: -1: undefined, chosen automatically. 3: attenuation and scatter correction, 1: attenuation correction only, 0: no correction (randoms only)
+                                    fcomment='',    # text comment used in the file name of generated image files
+                                    store_img=True)
+
+            # histogram data in span-1
+            hst = nipet.lm.mmrhist.hist(datain, txLUT, axLUT, Cnt, t0=time[0],
+                                        t1=time[1])
+            # get randoms in span-1
+            rsn, _ = nipet.lm.mmrhist.rand(hst['fansums'], txLUT, axLUT, Cnt)
+
+            # get norm sino
+            nsn = nipet.mmrnorm.get_sino(datain, hst, axLUT, txLUT, Cnt)    
+
+
+            ssn = nipet.sct.mmrsct.vsm(datain, [muhdic['im'], muodic['im']],
+                                             recpet['im'], hst,
+                                             rsn, mMRparams)
+
+
+            # take the subsets of all the sinograms (scatter sino will be
+            # separately calculated)
+            psn = hst['psino']
+            # also the reconstructed image for reference
+            imp = nipet.img.mmrimg.convert2dev(recpet['im'], Cnt)
+
+            muo = nipet.img.mmrimg.convert2dev(muodic['im'], Cnt)
+            muh = nipet.img.mmrimg.convert2dev(muhdic['im'], Cnt)
+
+            op = operator_mmr(span=span)
+            image_attenuation = muo + muh
+
+            att = op.putgaps(op.project_attenuation(image_attenuation))
+
+            # form dictionary of reduced input sinograms
+            
+            data_dict = {'psn': psn, 'nsn': nsn, 'rsn': rsn, 'ssn': ssn,
+                  'muh': muh, 'muo': muo, 'imp': imp, 'att': att}
+
+            np.save(filename_nipet, data_dict)
+
+        else:
+            print('file {} exists. Load it.'.format(filename_nipet))
+            data_dict = np.load(filename_nipet).tolist()
+
+        Cnt, txLUT, axLUT = get_geometry_mmr(span, rings)
+
+        # get precomputed values
+        psn = data_dict['psn']
+        nsn = data_dict['nsn']
+        rsn = data_dict['rsn']
+        ssn = data_dict['ssn']
+        imp = data_dict['imp']
+        att = data_dict['att']
+        muo = data_dict['muo']
+        muh = data_dict['muh']
+        data_dict = None
+
+        nrings = rings[1] - rings[0]
+        if nrings < 64:
+            # reduce axial FOV: get updated axial LUTs with new entries also in Cnt
+            # (number of sinograms, rings and axial voxels)
+            axLUT = reduce_rings(axLUT, Cnt, rings)
+
+            # take the subsets of all the sinograms (scatter sino will be
+            # separately calculated)
+            psn = psn[axLUT['rLUT'], :, :]
+            nsn = nsn[axLUT['rLUT'], :, :]
+            rsn = rsn[axLUT['rLUT'], :, :]
+            ssn = ssn[axLUT['rLUT'], :, :]
+            att = att[axLUT['rLUT'], :, :]
+
+        # also the reconstructed image for reference
+        image = imp[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
+
+        image_ct = muo[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
+
+        op = operator_mmr(span=span, rings=rings)
+
+        data = np.uint16(op.remgaps(psn))
+        psn = None
+
+        background = op.remgaps(rsn + ssn)
+        factors = op.remgaps(att * nsn)
+
+        normalisation = op.remgaps(nsn)
+        attenuation = op.remgaps(att)
+        scatter = op.remgaps(ssn)
+        randoms = op.remgaps(rsn)
+        rsn, ssn, nsn, att = [None, ] * 4
+
+
+        np.save(filename_data, (data, background, factors, image, image_ct))
+        Y = op.range
+        x = Y.one()
+        sens1 = op.adjoint(x).asarray()
+        opn = operator_mmr(span=span, rings=rings, factors=normalisation)
+        sens2 = opn.adjoint(x).asarray()
+        opf = operator_mmr(span=span, rings=rings, factors=factors)
+        sens3 = opf.adjoint(x).asarray()
+        x = None
+
+        def show_sino(x, title):
+            fig.append(plt.figure())
+            clim = [x.min(), x.max()]
+            x = Y.element(x)
+            misc.imagesc3(op.putgaps(x), clim=clim, title=title)
+
+        def show_image(x, title):
+            fig.append(plt.figure())
+            misc.imagesc3(x, [x.min(), x.max()], title=title)
+
+        fig = []
+        show_sino(normalisation, 'normalisation')
+        show_sino(attenuation, 'attenuation')
+        show_sino(factors, 'multiplicative correction factors')
+        show_sino(data, 'data')
+        show_sino(scatter, 'scatter')
+        show_sino(randoms, 'randoms')
+
+        show_image(sens1, title='sensitivity geometry')
+        show_image(sens2, title='sensitivity geometry + norm')
+        show_image(sens3, title='sensitivity geometry + norm + att')
+
+        show_image(muh, title='hardware attenuation')
+        show_image(image_ct, title='object attenuation')
+
+        bg = op.putgaps(Y.element(background))
+        r = op.putgaps(Y.element(randoms))
+        s = op.putgaps(Y.element(scatter))
+        d = op.putgaps(Y.element(data))
+        a = op.putgaps(Y.element(attenuation))
+        n = op.putgaps(Y.element(normalisation))
+        f = op.putgaps(Y.element(factors))
+
+        fig.append(plt.figure())
+        ind = np.int32(np.array(bg.shape) / 3)
+        plt.plot(d[ind[0], ind[1], :], label='data')
+        plt.plot(bg[ind[0], ind[1], :], label='background')
+        plt.plot(s[ind[0], ind[1], :], label='scatter')
+        plt.plot(r[ind[0], ind[1], :], label='randoms')
+        plt.legend()
+        plt.title('data, 1d')
+
+        fig.append(plt.figure())
+        ind = np.int32(np.array(bg.shape) / 2)
+        plt.plot(d[ind[0], ind[1], :], label='data')
+        plt.plot(10 * f[ind[0], ind[1], :], label='10 x factors')
+        plt.plot(10 * a[ind[0], ind[1], :], label='10 x attenuation')
+        plt.plot(10 * n[ind[0], ind[1], :], label='10 x normalization')
+        plt.legend()
+        plt.title('data, 1d')
+
+        fig.append(plt.figure())
+        ind = np.int32(np.array(bg.shape) / 1.5)
+        plt.plot(d[ind[0], ind[1], :], label='data')
+        plt.plot(bg[ind[0], ind[1], :], label='background')
+        plt.plot(10 * f[ind[0], ind[1], :], label='10 x factors')
+        plt.legend()
+        plt.title('data, 1d')
+        bg, d, a, n, r, s = [None, ] * 6
+
+        fig.append(plt.figure())
+        maxclim = 0.9 * image.max()
+        misc.imagesc3(image, clim=[0, maxclim], title='PET recon')
+
+        #XXX fig.append(plt.figure())
+        # maxclim = 0.9 * image_mr.max()
+        # misc.imagesc3(image_mr, clim=[0, maxclim], title='MRI')
+
+        for i, f in enumerate(fig):
+            filename = '{}_{}.png'.format(filename_data[:-4], i)
+            f.savefig(filename, bbox_inches='tight')
+
+    else:
+        print('file {} exists. Load it.'.format(filename_data))
+        data, background, factors, image, image_ct = \
+            np.load(filename_data, allow_pickle = True)
+
+    return data, background, factors, image, image_ct
+
+
 
 
 def operator_mmr(span=1, rings=(0, 64), im_shape=None, sino_partition=None,
                  factors=None, odlcuda=False, gpu_index=None, memory=True):
+    """ 
+    Define ODL operator corresponding to forward operator
+    
+    If sino_partition is not None nor sino_partition[0] is scalar, returns BroadcastOperator"""
 
     # get backend and precision
     if odlcuda:
@@ -77,6 +592,7 @@ def operator_mmr(span=1, rings=(0, 64), im_shape=None, sino_partition=None,
 
 
 def get_geometry_mmr(span, rings):
+    """ Set scanner geometry for given span and rings and return it """
 
     # the span of the data, related to compression
     if span not in [1, 11]:
@@ -108,6 +624,7 @@ def get_geometry_mmr(span, rings):
 
 
 def get_domain_mmr(geometry, im_shape, impl, dtype):
+    """ Get PET image ODL space"""
 
     # geometry of the scanner
     Cnt, txLUT, axLUT = geometry
@@ -129,7 +646,7 @@ def get_domain_mmr(geometry, im_shape, impl, dtype):
 
 
 def get_range_mmr(geometry, subsets, sino_partition, impl, dtype):
-
+    """ Get PET sinogram  ODL space"""
     # geometry of the scanner
     Cnt, txLUT, axLUT = geometry
 
@@ -155,7 +672,7 @@ def get_range_mmr(geometry, subsets, sino_partition, impl, dtype):
 
 
 class OperatorMmr(odl.Operator):
-    """Class for the xray transform using nipet."""
+    """ODL class for the xray transform using nipet."""
 
     def __init__(self, domain, range, geometry, sino_ind, factors=None,
                  gpu_index=None, memory=True):
@@ -164,16 +681,16 @@ class OperatorMmr(odl.Operator):
 
         Arguments:
         ----------
-        sImage : list, tuple, np.array
-            Size of the input images
-        iSinogram : list, tuple, np.array (optional)
-            list of sinogram bins to compute during projection
-        span : string (optional)
-            span of the projector
-        computeNorm : boolean (optional)
-            Do you want to compute the norm of the operator?
-        factor : float (optional)
-            Factor, that can be used for instance to model the noise level.
+        domain : ODL space
+            image space
+        range : ODL space
+            data space
+        geometry : tuple
+            scanner geometry
+        sino_ind : list
+            Sinogram partition
+        factors : ODL SpaceElement
+            Factors, that can be used for instance to model attenuation corr.
 
         Returns:
         --------
@@ -233,15 +750,15 @@ class OperatorMmr(odl.Operator):
                 out *= self.range.element(self.factors)
 
         return out
-
+    
     def project_attenuation(self, image_large, out=None):
         """
-        Implementation of the forward operator.
+        Computes attenuation factors
 
         Arguments:
         ----------
         image : array
-            Three dimensional image input
+            Three dimensional image input, corresponding to mu-map, scanner format
 
         Returns:
         --------
@@ -249,19 +766,6 @@ class OperatorMmr(odl.Operator):
             output data, stored as a stack of sinograms
         """
 
-        """
-        Implementation of the forward operator.
-
-        Arguments:
-        ----------
-        image : array
-            Three dimensional image input
-
-        Returns:
-        --------
-        sino : array
-            output data, stored as a stack of sinograms
-        """
 
         if out is None:
             out = self.range.zero()
@@ -271,6 +775,35 @@ class OperatorMmr(odl.Operator):
         tmp_out = np.zeros(self.range.shape, dtype='float32')
 
         nipet.prj.petprj.fprj(tmp_out, image_large, txLUT, axLUT, ind, Cnt, 1)
+        out[:] = tmp_out
+
+        return out
+
+    def project_attenuation_owndim(self, image, out=None):
+        """
+        Computes attenuation factors
+
+        Arguments:
+        ----------
+        image : array
+            Three dimensional image input, corresponding to mu-map, own format
+
+        Returns:
+        --------
+        sino : array
+            output data, stored as a stack of sinograms
+        """
+
+
+        if out is None:
+            out = self.range.zero()
+        
+        tmp_im = self.fromodl(image)
+        Cnt, txLUT, axLUT = self.geometry
+        ind = self.sino_ind
+        tmp_out = np.zeros(self.range.shape, dtype='float32')
+
+        nipet.prj.petprj.fprj(tmp_out, tmp_im, txLUT, axLUT, ind, Cnt, 1)
         out[:] = tmp_out
 
         return out
@@ -339,7 +872,7 @@ class OperatorMmr(odl.Operator):
 
 
 class OperatorMmrAdjoint(odl.Operator):
-    """Class for the adjoint of the xray transform using nipet."""
+    """ODL class for the adjoint of the xray transform using nipet."""
 
     def __init__(self, adjoint):
 
@@ -553,242 +1086,52 @@ def reduce_rings(axLUT, Cnt, rings=(0, 64)):
     return raxLUT
 
 
-def load_data(folder_data, span=1, rings=(0, 64), time=None):
-    if time is None:
-        time = (0, 0)
-        s_time = ''
-    else:
-        s_time = '_time{}-{}'.format(time[0], time[1])
 
-    filename_data = '{}/data_rings{}-{}_span{}{}.npy'.format(
-            folder_data, rings[0], rings[1], span, s_time)
 
-    if not os.path.exists(filename_data):
-        print('file {} does NOT exists. Compute it.'.format(filename_data))
 
-        filename_nipet = '{}/data_nipet_span{}{}.npy'.format(folder_data, span,
-                                                             s_time)
-        if not os.path.exists(filename_nipet):
-            print('file {} does NOT exists. Compute it.'
-                  .format(filename_nipet))
-
-            # get all the default constants and LUTs
-            mMRparams = nipet.mmraux.mMR_params()
-            mMRparams['Cnt']['SPN'] = span
-            mMRparams['Cnt']['VERBOSE'] = True  # Switch ON verbose mode
-
-            Cnt = mMRparams['Cnt']
-            txLUT = mMRparams['txLUT']
-            axLUT = mMRparams['axLUT']
-
-            datain = nipet.mmraux.explore_input(folder_data, mMRparams)
-
-            muhdic = nipet.img.mmrimg.hdw_mumap(datain, [1, 2, 4], mMRparams,
+def simul_data(span=1):
+    """ Simulate data, backgrounds, factors of ellipsoid phantom"""
+    
+    mMRparams = nipet.get_mmrparams() #mMRparams = nipet.mmraux.mMR_params()
+    mMRparams['Cnt']['SPN'] = span
+    mMRparams['Cnt']['VERBOSE'] = True  # Switch ON verbose mode
+    Cnt = mMRparams['Cnt']
+    
+    RT = operator_mmr()
+    X = RT.domain
+    Y = RT.range
+    
+    min_pt = np.array([-110, -80, -50])
+    max_pt = np.array([75, 75, 128])
+    phantom = 0.5 * odl.phantom.transmission.shepp_logan(X, modified = False, 
+                                                   min_pt=min_pt, max_pt= max_pt)
+    # object mu-map
+    ellipses = odl.phantom.shepp_logan_ellipsoids(3, modified = False)
+    # keep 2 first ellipses (head)
+    ellipses = ellipses[0:2]
+    mu_bone = 0.172
+    mu_water = 0.096        
+    ellipses[0][0] = mu_bone
+    ellipses[1][0] = mu_water - mu_bone
+    phantom_mumap = odl.phantom.ellipsoid_phantom(X, ellipses, min_pt=min_pt,
+                                               max_pt= max_pt)
+    # hardware mu-map
+    folderin = '/home/cd902/siemens-biograph_data/amyloidPET_FBP_TP0'
+    datain = nipet.classify_input(folderin, mMRparams)
+    muhdic = nipet.img.mmrimg.hdw_mumap(datain, [1, 2, 4], mMRparams,
                                                 use_stored=True)
+    muh = nipet.img.mmrimg.convert2dev(muhdic['im'], Cnt)
+    # attenuation
+    factors = RT.project_attenuation_owndim(phantom_mumap) + RT.project_attenuation(muh)
+    FWD = operator_mmr(factors=factors)
+    # background
+    sino = FWD(phantom)
+    sino_supp = sino.ufuncs.greater(0)
+    smooth_supp = Y.element(gaussian_filter(sino_supp, sigma=1))
+    background = smooth_supp + 1.0
+    background *= 1.05e8 / background.ufuncs.sum()
+    seed = 1807
+    data = odl.phantom.poisson_noise(sino + background, seed=seed)
+    
+    return data, background, factors
 
-            muodic = nipet.img.mmrimg.obj_mumap(datain, mMRparams, store=True)
-
-            outpath = os.path.join(datain['corepath'], 'output')
-
-            recpet = nipet.img.rec.osem(datain,
-                                        mMRparams,
-                                        mu_h=muhdic,
-                                        mu_o=muodic, # or mupdct
-                                        frames=['fluid', [time[0],time[1]]], # definition of time frames
-                                        outpath=outpath,     # output path for results
-                                        itr=4,          # number of OSEM iterations
-                                        fwhm=0.,        # Gaussian Smoothing FWHM
-                                        recmod=3,    # reconstruction mode: -1: undefined, chosen automatically. 3: attenuation and scatter correction, 1: attenuation correction only, 0: no correction (randoms only)
-                                        fcomment='',    # text comment used in the file name of generated image files
-                                        store_img=True)
-
-            # histogram data in span-1
-            hst = nipet.lm.mmrhist.hist(datain, txLUT, axLUT, Cnt, t0=time[0],
-                                        t1=time[1])
-            # get randoms in span-1
-            rsn, _ = nipet.lm.mmrhist.rand(hst['fansums'], txLUT, axLUT, Cnt)
-
-            # get norm sino
-            nsn = nipet.mmrnorm.get_sino(datain, hst, axLUT, txLUT, Cnt)
-
-            # get scatter in span-1
-            ssn, _, _ = nipet.sct.mmrsct.scatter([muhdic['im'], muodic['im']],
-                                                 recpet['img'], datain, hst,
-                                                 rsn, txLUT, axLUT, Cnt)
-
-            # get registered mri image
-            mri_folder = datain['corepath'] + '/T1/mr2pet/'
-            if not os.path.exists(mri_folder):
-                nipet.img.mmrimg.mr2petAffine(datain, Cnt,
-                                              recpet['recon'].fpet)
-
-            mri_list = os.listdir(mri_folder)
-            for mri_file in mri_list:
-                if mri_file.endswith('nii.gz'):
-                    mri_t1 = nipet.img.mmrimg.getnii(mri_folder + mri_file)
-
-            # take the subsets of all the sinograms (scatter sino will be
-            # separately calculated)
-            psn = hst['psino']
-            # also the reconstructed image for reference
-            imp = nipet.img.mmrimg.convert2dev(recpet['img'], Cnt)
-            # mri image for reference or anatomical priors
-            mri = nipet.img.mmrimg.convert2dev(mri_t1, Cnt)
-
-            muo = nipet.img.mmrimg.convert2dev(muodic['im'], Cnt)
-            muh = nipet.img.mmrimg.convert2dev(muhdic['im'], Cnt)
-
-            op = operator_mmr(span=span)
-            image_attenuation = muo + muh
-
-            att = op.putgaps(op.project_attenuation(image_attenuation))
-
-            # form dictionary of reduced input sinograms
-            data_dict = {'psn': psn, 'nsn': nsn, 'rsn': rsn, 'ssn': ssn,
-                         'muh': muh, 'muo': muo, 'imp': imp, 'att': att,
-                         'mri': mri}
-
-            np.save(filename_nipet, data_dict)
-
-        else:
-            print('file {} exists. Load it.'.format(filename_nipet))
-            data_dict = np.load(filename_nipet).tolist()
-
-        Cnt, txLUT, axLUT = get_geometry_mmr(span, rings)
-
-        # get precomputed values
-        psn = data_dict['psn']
-        nsn = data_dict['nsn']
-        rsn = data_dict['rsn']
-        ssn = data_dict['ssn']
-        imp = data_dict['imp']
-        att = data_dict['att']
-        mri = data_dict['mri']
-        muo = data_dict['muo']
-        muh = data_dict['muh']
-        data_dict = None
-
-        nrings = rings[1] - rings[0]
-        if nrings < 64:
-            # reduce axial FOV: get updated axial LUTs with new entries also in Cnt
-            # (number of sinograms, rings and axial voxels)
-            axLUT = reduce_rings(axLUT, Cnt, rings)
-
-            # take the subsets of all the sinograms (scatter sino will be
-            # separately calculated)
-            psn = psn[axLUT['rLUT'], :, :]
-            nsn = nsn[axLUT['rLUT'], :, :]
-            rsn = rsn[axLUT['rLUT'], :, :]
-            ssn = ssn[axLUT['rLUT'], :, :]
-            att = att[axLUT['rLUT'], :, :]
-
-        # also the reconstructed image for reference
-        image = imp[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
-        image_mr = mri[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
-
-        image_ct = muo[:, :, 2*Cnt['RNG_STRT']:2*Cnt['RNG_END']-1]
-
-        op = operator_mmr(span=span, rings=rings)
-
-        data = np.uint16(op.remgaps(psn))
-        psn = None
-
-        background = op.remgaps(rsn + ssn)
-        factors = op.remgaps(att * nsn)
-
-        normalisation = op.remgaps(nsn)
-        attenuation = op.remgaps(att)
-        scatter = op.remgaps(ssn)
-        randoms = op.remgaps(rsn)
-        rsn, ssn, nsn, att = [None, ] * 4
-
-        np.save(filename_data, (data, background, factors, image, image_mr,
-                                image_ct))
-
-        Y = op.range
-        x = Y.one()
-        sens1 = op.adjoint(x).asarray()
-        opn = operator_mmr(span=span, rings=rings, factors=normalisation)
-        sens2 = opn.adjoint(x).asarray()
-        opf = operator_mmr(span=span, rings=rings, factors=factors)
-        sens3 = opf.adjoint(x).asarray()
-        x = None
-
-        def show_sino(x, title):
-            fig.append(plt.figure())
-            clim = [x.min(), x.max()]
-            x = Y.element(x)
-            misc.imagesc3(op.putgaps(x), clim=clim, title=title)
-
-        def show_image(x, title):
-            fig.append(plt.figure())
-            misc.imagesc3(x, [x.min(), x.max()], title=title)
-
-        fig = []
-        show_sino(normalisation, 'normalisation')
-        show_sino(attenuation, 'attenuation')
-        show_sino(factors, 'multiplicative correction factors')
-        show_sino(data, 'data')
-        show_sino(scatter, 'scatter')
-        show_sino(randoms, 'randoms')
-
-        show_image(sens1, title='sensitivity geometry')
-        show_image(sens2, title='sensitivity geometry + norm')
-        show_image(sens3, title='sensitivity geometry + norm + att')
-
-        show_image(muh, title='hardware attenuation')
-        show_image(image_ct, title='object attenuation')
-
-        bg = op.putgaps(Y.element(background))
-        r = op.putgaps(Y.element(randoms))
-        s = op.putgaps(Y.element(scatter))
-        d = op.putgaps(Y.element(data))
-        a = op.putgaps(Y.element(attenuation))
-        n = op.putgaps(Y.element(normalisation))
-        f = op.putgaps(Y.element(factors))
-
-        fig.append(plt.figure())
-        ind = np.int32(np.array(bg.shape) / 3)
-        plt.plot(d[ind[0], ind[1], :], label='data')
-        plt.plot(bg[ind[0], ind[1], :], label='background')
-        plt.plot(s[ind[0], ind[1], :], label='scatter')
-        plt.plot(r[ind[0], ind[1], :], label='randoms')
-        plt.legend()
-        plt.title('data, 1d')
-
-        fig.append(plt.figure())
-        ind = np.int32(np.array(bg.shape) / 2)
-        plt.plot(d[ind[0], ind[1], :], label='data')
-        plt.plot(10 * f[ind[0], ind[1], :], label='10 x factors')
-        plt.plot(10 * a[ind[0], ind[1], :], label='10 x attenuation')
-        plt.plot(10 * n[ind[0], ind[1], :], label='10 x normalization')
-        plt.legend()
-        plt.title('data, 1d')
-
-        fig.append(plt.figure())
-        ind = np.int32(np.array(bg.shape) / 1.5)
-        plt.plot(d[ind[0], ind[1], :], label='data')
-        plt.plot(bg[ind[0], ind[1], :], label='background')
-        plt.plot(10 * f[ind[0], ind[1], :], label='10 x factors')
-        plt.legend()
-        plt.title('data, 1d')
-        bg, d, a, n, r, s = [None, ] * 6
-
-        fig.append(plt.figure())
-        maxclim = 0.9 * image.max()
-        misc.imagesc3(image, clim=[0, maxclim], title='PET recon')
-
-        fig.append(plt.figure())
-        maxclim = 0.9 * image_mr.max()
-        misc.imagesc3(image_mr, clim=[0, maxclim], title='MRI')
-
-        for i, f in enumerate(fig):
-            filename = '{}_{}.png'.format(filename_data[:-4], i)
-            f.savefig(filename, bbox_inches='tight')
-
-    else:
-        print('file {} exists. Load it.'.format(filename_data))
-        data, background, factors, image, image_mr, image_ct = \
-            np.load(filename_data)
-
-    return data, background, factors, image, image_mr, image_ct

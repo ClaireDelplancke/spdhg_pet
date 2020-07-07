@@ -14,6 +14,12 @@ from matplotlib.pyplot import imsave
 plt.switch_backend('agg')
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
+__all__ = ('norms', 'norm', 'save_image', 'what_to_save', 'resort_out',
+           'quick_visual_output', 'get_ind', 'plots_paper', 'plots_paper_psnr',
+           'colors_set', 'colors_pair', 'colors_sequ', 'mkdir', 'now', 'imagesc',
+           'imagesc3', 'kullback_leibler', 'MLEM', 'OSEM', 'COSEM', 'default_fun_select',
+           'default_callback')
+
 
 def norms(ops, file_norm):
     if not os.path.exists(file_norm):
@@ -177,13 +183,19 @@ def quick_visual_output(iter_save, algs, out, niter_per_epoch, folder_today):
                         y = out[alg][meas][1:]
                         plt.semilogx(x, y, linewidth=3, label=alg)
 
-            plt.title('{} v iteration'.format(meas))
+            #plt.title('{} v iteration'.format(meas))
             h = plt.gca()
             h.set_xlabel('epochs')
-            plt.legend(loc='best')
+            if '{}'.format(meas) == 'psnr_opt':
+                h.set_ylabel('PSNR')
+            else:
+                h.set_ylabel('{}'.format(meas))
+            plt.legend(loc='best', fontsize=15)
 
+            for item in [h.xaxis.label, h.yaxis.label] + h.get_xticklabels() + h.get_yticklabels():
+                item.set_fontsize(15)
             fig.savefig('{}/pics/{}{}_{}.png'.format(folder_today, prefix,
-                        meas, plotx), bbox_inches='tight')
+                        meas, plotx), bbox_inches='tight', pad_inches=0.0)
 
 
 def get_ind(x, y, xlim, ylim):
@@ -603,7 +615,8 @@ class KullbackLeibler(odl.solvers.Functional):
         background : ``space`` `element-like`
             Background term, positive.
         """
-        super().__init__(space=space, linear=False, grad_lipschitz=np.nan)
+        # super().__init__(space=space, linear=False, grad_lipschitz=np.nan) #python 3 syntax
+        super(KullbackLeibler, self).__init__(space, linear=False, grad_lipschitz=np.nan)
 
         if data not in self.domain:
             raise ValueError('`data` not in `domain`'
@@ -809,7 +822,8 @@ class KullbackLeiblerConvexConj(odl.solvers.Functional):
         background : ``space`` `element-like`
             Background term, positive.
         """
-        super().__init__(space=space, linear=False, grad_lipschitz=np.nan)
+        # super().__init__(space=space, linear=False, grad_lipschitz=np.nan) Python 3 syntax
+        super(KullbackLeiblerConvexConj, self).__init__(space=space, linear=False, grad_lipschitz=np.nan)
 
         if data not in self.domain:
             raise ValueError('`data` not in `domain`'
@@ -857,30 +871,6 @@ class KullbackLeiblerConvexConj(odl.solvers.Functional):
         are larger than or equal to one.
         """
         functional = self
-
-        class KLCCGradient(odl.Operator):
-
-            """The gradient operator of this functional."""
-
-            def __init__(self):
-                """Initialize a new instance."""
-                super().__init__(functional.domain, functional.domain,
-                                 linear=False)
-
-            def _call(self, x):
-                """Apply the gradient operator to the given point.
-
-                The gradient is not defined in points where one or more
-                components are larger than or equal to one.
-                """
-
-                raise NotImplementedError
-
-                if functional.prior is None:
-                    return 1.0 / (1 - x)
-                else:
-                    return functional.data / (1 - x)
-
         return KLCCGradient()
 
     def proximal(self, sigma):
@@ -894,92 +884,6 @@ class KullbackLeiblerConvexConj(odl.solvers.Functional):
             Proximal of the convex conjugate of a functional.
         """
 
-        class ProximalCConjKL(odl.Operator):
-
-            """Proximal operator of the convex conjugate of the KL divergence."""
-
-            def __init__(self, sigma, data, background):
-                """Initialize a new instance.
-
-                Parameters
-                ----------
-                sigma : positive float
-                """
-                self.sigma = sigma
-                self.data = data
-                self.background = background
-                super().__init__(domain=data.space, range=data.space,
-                     linear=False)
-
-            def _call(self, x, out):
-                """
-                Examples
-                --------
-                >>> X = odl.rn(1)
-                >>> data = X.element(4)
-                >>> background = X.element(1)
-                >>> KL = KullbackLeibler(X, data, background)
-                >>> x = X.element(1)
-                >>> KL.convex_conj.proximal(2)(x)
-                X.element(-1)
-
-                >>> data = X.element(0)
-                >>> KL = KullbackLeibler(X, data, background)
-                >>> KL.convex_conj.proximal(2)(x)
-                X.element(1)
-                """
-
-                # Let y = data, r = background, z = x + s * r
-                # Compute 0.5 * (z + 1 - sqrt((z - 1)**2 + 4 * s * y))
-                # Currently it needs 3 extra copies of memory.
-
-                # define short variable names
-                y = self.data
-                r = self.background
-                s = self.sigma
-
-                # Compute
-                #   sum(x + r - y + y * log(y / (x + r)))
-                # = sum(x - y * log(x + r)) + self.offset
-                # Assume that
-                #   x + r > 0
-
-                z = self.domain.element()
-                z.assign(r)
-
-                if np.size(s) == 1:
-                    z.lincomb(s, z, 1, x)
-                else:
-                    z *= s
-                    z += x
-
-                # compute sqrt
-                out.assign(z)
-                out -= 1
-                out.ufuncs.square(out=out)
-
-                if np.size(s) == 1:
-                    out.lincomb(1, out, 4 * s, y)
-
-                else:
-                    # compute sigma * y
-                    tmp = self.domain.element()
-                    tmp.assign(y)
-                    tmp *= s
-                    out.lincomb(1, out, 4, tmp)
-
-                    del(tmp)
-
-                out.ufuncs.sqrt(out=out)
-
-                # out = 0.5 * (z + 1 - sqrt(...))
-                out.lincomb(1, z, -1, out)
-
-                del(z)
-
-                out += 1
-                out /= 2.
-
         return ProximalCConjKL(sigma, self.data, self.background)
 
     @property
@@ -992,6 +896,116 @@ class KullbackLeiblerConvexConj(odl.solvers.Functional):
         return '{}({!r}, {!r}, {!r})'.format(self.__class__.__name__,
                                              self.domain, self.data,
                                              self.background)
+class KLCCGradient(odl.Operator):
+
+    """The gradient operator of this functional."""
+
+    def __init__(self):
+        """Initialize a new instance."""
+        super(KLCCGradient, self).__init__(functional.domain, functional.domain,
+                         linear=False)
+
+    def _call(self, x):
+        """Apply the gradient operator to the given point.
+
+        The gradient is not defined in points where one or more
+        components are larger than or equal to one.
+        """
+
+        raise NotImplementedError
+
+        if functional.prior is None:
+            return 1.0 / (1 - x)
+        else:
+            return functional.data / (1 - x)
+    
+class ProximalCConjKL(odl.Operator):
+    """Proximal operator of the convex conjugate of the KL divergence."""
+
+    def __init__(self, sigma, data, background):
+        """Initialize a new instance.
+
+        Parameters
+        ----------
+        sigma : positive float
+        """
+        self.sigma = sigma
+        self.data = data
+        self.background = background
+        # super().__init__(domain=data.space, range=data.space,
+        #      linear=False) Python 3 syntax
+        super(ProximalCConjKL, self).__init__(domain=data.space, 
+                                              range=data.space, 
+                                              linear=False)
+
+    def _call(self, x, out):
+        """
+        Examples
+        --------
+        >>> X = odl.rn(1)
+        >>> data = X.element(4)
+        >>> background = X.element(1)
+        >>> KL = KullbackLeibler(X, data, background)
+        >>> x = X.element(1)
+        >>> KL.convex_conj.proximal(2)(x)
+        X.element(-1)
+
+        >>> data = X.element(0)
+        >>> KL = KullbackLeibler(X, data, background)
+        >>> KL.convex_conj.proximal(2)(x)
+        X.element(1)
+        """
+
+        # Let y = data, r = background, z = x + s * r
+        # Compute 0.5 * (z + 1 - sqrt((z - 1)**2 + 4 * s * y))
+        # Currently it needs 3 extra copies of memory.
+
+        # define short variable names
+        y = self.data
+        r = self.background
+        s = self.sigma
+
+        # Compute
+        #   sum(x + r - y + y * log(y / (x + r)))
+        # = sum(x - y * log(x + r)) + self.offset
+        # Assume that
+        #   x + r > 0
+
+        z = self.domain.element()
+        z.assign(r)
+
+        if np.size(s) == 1:
+            z.lincomb(s, z, 1, x)
+        else:
+            z *= s
+            z += x
+
+        # compute sqrt
+        out.assign(z)
+        out -= 1
+        out.ufuncs.square(out=out)
+
+        if np.size(s) == 1:
+            out.lincomb(1, out, 4 * s, y)
+
+        else:
+            # compute sigma * y
+            tmp = self.domain.element()
+            tmp.assign(y)
+            tmp *= s
+            out.lincomb(1, out, 4, tmp)
+
+            del(tmp)
+
+        out.ufuncs.sqrt(out=out)
+
+        # out = 0.5 * (z + 1 - sqrt(...))
+        out.lincomb(1, z, -1, out)
+
+        del(z)
+
+        out += 1
+        out /= 2.
         
 
 def MLEM(x, data, background, A, niter, **kwargs):
@@ -1241,4 +1255,6 @@ def default_callback(step=1):
                                 fmt='elapsed = {:5.03f} s', end=', ') &
             CallbackPrintTiming(step=step, fmt='total = {:5.03f} s',
                                 cumulative=True))
+
+
 
