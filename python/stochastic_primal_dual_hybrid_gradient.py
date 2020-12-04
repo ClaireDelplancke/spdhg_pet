@@ -3,6 +3,7 @@
 from __future__ import print_function, division
 import numpy as np
 import odl
+import logging
 
 def pdhg(x, f, g, A, tau, sigma, niter, **kwargs):
     """Computes a saddle point with PDHG.
@@ -242,6 +243,7 @@ def spdhg_generic(x, y, z, f, g, A, tau, sigma, niter, prob, fun_select,
 
     # run the iterations
     for k in range(niter):
+        logging.info('Iteration {} of {}'.format(k, niter))
 
         # select block
         selected = fun_select(k)
